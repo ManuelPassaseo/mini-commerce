@@ -1,0 +1,99 @@
+```css
+* {
+    box-sizing: border-box;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+body {
+    margin: 30px;
+}
+
+h1 {
+    text-align: center;
+    margin-bottom: 30px;
+}
+
+.container {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 30px;
+}
+
+.catalog,
+.checkout {
+    padding: 10px;
+}
+
+#products {
+    display: grid;
+    gap: 15px;
+}
+
+.product-card {
+    border: 1px solid #ccc;
+    padding: 15px;
+}
+
+.product-card h3 {
+    margin-top: 0;
+}
+
+.product-card p {
+    margin: 6px 0;
+}
+
+.product-card button {
+    margin-top: 10px;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+
+.product-card button:disabled {
+    cursor: not-allowed;
+}
+
+.cart-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 12px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #ddd;
+}
+
+.quantity-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.quantity-controls button {
+    width: 25px;
+    height: 25px;
+    padding: 0;
+    cursor: pointer;
+}
+
+.quantity-controls span {
+    min-width: 20px;
+    text-align: center;
+}
+
+.checkout input {
+    display: block;
+    width: 100%;
+    padding: 7px;
+    margin-bottom: 10px;
+}
+
+#orderButton {
+    width: 100%;
+    padding: 8px;
+    cursor: pointer;
+}
+
+#message {
+    margin-top: 15px;
+    font-weight: bold;
+}
+```

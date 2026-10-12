@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>MiniCommerce</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>MiniCommerce</h1>
+
+<div class="container">
+
+    <div class="catalog">
+        <h2>Catalogo prodotti</h2>
+        <div id="products"></div>
+    </div>
+
+    <div class="checkout">
+
+        <h2>Carrello</h2>
+        <div id="cart">
+            <p>Il carrello è vuoto.</p>
+        </div>
+
+        <hr>
+
+        <h2>Checkout</h2>
+
+        <input
+                id="customerId"
+                type="text"
+                placeholder="Customer ID"
+        >
+
+        <input
+                id="cardNumber"
+                type="text"
+                placeholder="Numero carta"
+        >
+
+        <button id="orderButton">
+            Effettua ordine
+        </button>
+
+        <p id="message"></p>
+
+    </div>
+
+</div>
+
+<script src="app.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,3 @@
+spring:
+  application:
+    name: mini_commerce-v3
