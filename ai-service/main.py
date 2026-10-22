@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -6,16 +5,17 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from ollama import Client
 from pydantic import BaseModel
 
 
-app = FastAPI(title="MiniCommerce AI Order Assistant")
+app = FastAPI(title="MiniCommerce AI Product Search Assistant")
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURAZIONE
 # ============================================================
 
 OLLAMA_HOST = os.getenv(
@@ -25,7 +25,7 @@ OLLAMA_HOST = os.getenv(
 
 OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
-    os.getenv("MODEL_NAME", "qwen3:4b")
+    os.getenv("MODEL_NAME", "qwen3:1.7b")
 )
 
 PRODUCT_SERVICE_URL = os.getenv(
@@ -33,10 +33,41 @@ PRODUCT_SERVICE_URL = os.getenv(
     "http://localhost:9002"
 ).rstrip("/")
 
-PRODUCT_TIMEOUT = 20
-MAX_TOOL_ROUNDS = 5
+# Nome del query parameter con cui il Product Service filtra per nome,
+# es. GET /products?name=carne. Cambialo se il tuo servizio ne usa un altro.
+PRODUCT_SEARCH_PARAM = os.getenv("PRODUCT_SEARCH_PARAM", "name")
+
+# Se True, Python scarica /products UNA volta e tiene solo i prodotti il cui
+# name o description contiene uno dei termini cercati. Serve finché il
+# Product Service non filtra da solo. Quando lo farà, imposta LOCAL_FILTER=false
+# (e PRODUCT_SEARCH_PARAM) così la ricerca passa interamente al microservizio.
+LOCAL_FILTER = os.getenv("LOCAL_FILTER", "true").lower() == "true"
+
+REQUEST_TIMEOUT = 20
+MAX_SEARCH_TERMS = 5
+MAX_ITEMS = 5
+
+# Il frontend chiama questo servizio direttamente dal browser, quindi serve
+# CORS. "*" va bene in sviluppo; in produzione usa gli origin reali,
+# es. CORS_ORIGINS=http://localhost:3000,https://mio-sito.it
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"]
+)
 
 ollama_client = Client(host=OLLAMA_HOST)
+
+
+class ProductServiceError(RuntimeError):
+    """Il Product Service non è raggiungibile o risponde in modo non valido."""
 
 
 # ============================================================
@@ -51,241 +82,213 @@ class ChatRequest(BaseModel):
 # PRODUCT SERVICE
 # ============================================================
 
-def get_all_products() -> list[dict[str, Any]]:
-    """Retrieve all products from the Product Service."""
+def fetch_products(term: str | None = None) -> list[dict[str, Any]]:
+    """
+    GET /products. Con `term` passa il filtro al servizio
+    (es. /products?name=pollo); senza, restituisce l'intero catalogo.
+    """
 
     try:
         response = requests.get(
             f"{PRODUCT_SERVICE_URL}/products",
-            timeout=PRODUCT_TIMEOUT
-        )
-        response.raise_for_status()
-
-        products = response.json()
-
-        if not isinstance(products, list):
-            raise RuntimeError(
-                "Il Product Service non ha restituito una lista."
-            )
-
-        return products
-
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(
-            f"Product Service non raggiungibile: {exc}"
-        ) from exc
-
-
-def get_product(product_id: str) -> dict[str, Any] | None:
-    """Retrieve a product by its productId."""
-
-    try:
-        response = requests.get(
-            f"{PRODUCT_SERVICE_URL}/products/{product_id}",
-            timeout=PRODUCT_TIMEOUT
+            params={PRODUCT_SEARCH_PARAM: term} if term else None,
+            timeout=REQUEST_TIMEOUT
         )
 
+        # Nessun risultato.
         if response.status_code == 404:
-            return None
+            return []
 
         response.raise_for_status()
-        product = response.json()
-
-        # Il servizio può rispondere HTTP 200 con JSON null.
-        if product is None:
-            return None
-
-        if not isinstance(product, dict):
-            raise RuntimeError(
-                "Il Product Service ha restituito un prodotto non valido."
-            )
-
-        return product
+        items = response.json()
 
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(
+        raise ProductServiceError(
             f"Product Service non raggiungibile: {exc}"
         ) from exc
 
+    except ValueError as exc:
+        raise ProductServiceError(
+            "Il Product Service non ha restituito un JSON valido."
+        ) from exc
 
-# ============================================================
-# TOOL 1: SEARCH PRODUCTS
-# ============================================================
+    if items is None:
+        return []
 
-def search_products(query: str) -> dict[str, Any]:
-    """
-    Search the MiniCommerce product catalog.
+    if not isinstance(items, list):
+        raise ProductServiceError(
+            "Il Product Service non ha restituito una lista."
+        )
 
-    Args:
-        query: Product identifier, name or description to search for.
-    """
-
-    query = query.strip()
-
-    if not query:
-        return {
-            "query": query,
-            "products": [],
-            "count": 0
-        }
-
-    products = get_all_products()
-    query_lower = query.lower()
-    matches = []
-
-    for product in products:
-        product_id = str(product.get("productId") or "")
-        name = str(product.get("name") or "")
-        description = str(product.get("description") or "")
-
-        if any(
-                query_lower in field.lower()
-                for field in (product_id, name, description)
-        ):
-            matches.append({
-                "productId": product.get("productId"),
-                "name": product.get("name"),
-                "description": product.get("description"),
-                "price": product.get("price"),
-                "quantity": product.get("quantity")
-            })
-
-    return {
-        "query": query,
-        "products": matches,
-        "count": len(matches)
-    }
+    return [item for item in items if isinstance(item, dict)]
 
 
-# ============================================================
-# TOOL 2: CHECK STOCK
-# ============================================================
+def matches_term(product: dict[str, Any], term: str) -> bool:
+    """Il termine compare nel name o nella description del prodotto."""
 
-def check_stock(
-        product_id: str,
-        quantity: int
+    needle = term.casefold()
+
+    return any(
+        needle in str(product.get(field) or "").casefold()
+        for field in ("name", "description")
+    )
+
+
+def product_key(product: dict[str, Any]) -> Any:
+    key = product.get("productId")
+
+    if key is None:
+        key = json.dumps(product, sort_keys=True, default=str)
+
+    return key
+
+
+def with_request_checks(
+        product: dict[str, Any],
+        requested_quantity: int | None,
+        max_price: float | None
 ) -> dict[str, Any]:
     """
-    Verify product existence and requested stock availability.
+    Copia del prodotto con l'esito dei controlli sulla richiesta.
+    L'LLM estrae soltanto i numeri: i confronti con stock e prezzo
+    li fa Python, perché sono aritmetica esatta.
 
-    Args:
-        product_id: Exact product identifier from the catalog.
-        quantity: Number of units requested by the user.
+    Campi aggiunti (None se l'utente non ha indicato nulla da controllare):
+      requestedQuantity  unità richieste
+      quantityAvailable  True/False: lo stock copre la quantità richiesta
+      missingUnits       unità che mancano per coprire la richiesta
+      requestedMaxPrice  prezzo massimo per SINGOLO prodotto
+      withinBudget       True/False: il prezzo unitario è <= al massimo
     """
 
-    product_id = product_id.strip()
+    checked = dict(product)
 
-    if not product_id:
-        return {
-            "error": "product_id è obbligatorio."
-        }
+    checked["requestedQuantity"] = requested_quantity
+    checked["quantityAvailable"] = None
+    checked["missingUnits"] = None
+    checked["requestedMaxPrice"] = max_price
+    checked["withinBudget"] = None
 
-    if quantity <= 0:
-        return {
-            "productId": product_id,
-            "requestedQuantity": quantity,
-            "exists": None,
-            "available": False,
-            "reason": "La quantità deve essere maggiore di zero."
-        }
+    if requested_quantity is not None:
+        try:
+            stock = int(product.get("quantity"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            checked["quantityAvailable"] = stock >= requested_quantity
+            checked["missingUnits"] = max(0, requested_quantity - stock)
 
-    product = get_product(product_id)
+    if max_price is not None:
+        try:
+            price = float(product.get("price"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            checked["withinBudget"] = price <= max_price
 
-    if product is None:
-        return {
-            "productId": product_id,
-            "requestedQuantity": quantity,
-            "exists": False,
-            "available": False,
-            "reason": "Prodotto non trovato nel catalogo."
-        }
+    return checked
 
-    try:
-        if product.get("quantity") is None:
-            raise ValueError("Quantità assente")
 
-        available_quantity = int(product["quantity"])
+def failed_checks(product: dict[str, Any]) -> int:
+    """Quanti controlli (quantità, budget) il prodotto non supera."""
 
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"La quantità disponibile per {product_id} non è valida."
-        ) from exc
+    return (
+            (product["quantityAvailable"] is False)
+            + (product["withinBudget"] is False)
+    )
 
-    return {
-        "productId": product.get("productId", product_id),
-        "name": product.get("name"),
-        "price": product.get("price"),
-        "exists": True,
-        "requestedQuantity": quantity,
-        "availableQuantity": available_quantity,
-        "available": available_quantity >= quantity
-    }
+
+def search_products(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Cerca i prodotti di ogni richiesta e ne controlla quantità e budget.
+    Restituisce tutti i prodotti trovati, senza duplicati, anche se la
+    quantità non è disponibile o il prezzo supera il budget: i controlli
+    sono un'informazione, non un filtro.
+    """
+
+    # Con il filtro locale basta una sola chiamata al servizio.
+    catalog = fetch_products() if LOCAL_FILTER else None
+
+    found: dict[Any, dict[str, Any]] = {}
+
+    for item in items:
+        if catalog is not None:
+            matches = [
+                product for product in catalog
+                if any(
+                    matches_term(product, term)
+                    for term in item["searchTerms"]
+                )
+            ]
+        else:
+            matches = [
+                product
+                for term in item["searchTerms"]
+                for product in fetch_products(term)
+            ]
+
+        batch: dict[Any, dict[str, Any]] = {}
+
+        for product in matches:
+            key = product_key(product)
+
+            # Già trovato da una richiesta precedente: vale la prima.
+            if key in found:
+                continue
+
+            batch.setdefault(
+                key,
+                with_request_checks(
+                    product,
+                    item["quantity"],
+                    item["maxPrice"]
+                )
+            )
+
+        # Prima i prodotti che superano tutti i controlli, poi quelli
+        # che ne falliscono uno, poi due (l'ordine tra pari resta).
+        found.update(
+            sorted(
+                batch.items(),
+                key=lambda entry: failed_checks(entry[1])
+            )
+        )
+
+    return list(found.values())
 
 
 # ============================================================
-# TOOL SCHEMAS FOR OLLAMA
+# OUTPUT STRUTTURATO DEL MODELLO
+# Ollama costringe il modello a rispondere con un JSON conforme
+# a questo schema: non può "dimenticarsi" di estrarre i termini,
+# cosa che i modelli piccoli fanno spesso con il tool calling.
 # ============================================================
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_products",
-            "description": (
-                "Search the real MiniCommerce catalog by product ID, "
-                "name or description. Use this tool when the user asks "
-                "to find a product, mentions a product ID without a "
-                "quantity, or when product existence must be verified. "
-                "Do not invent catalog results."
-            ),
-            "parameters": {
+SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "The product ID, name or description "
-                            "to search for."
-                        )
+                    "search_terms": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "quantity": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}]
+                    },
+                    "max_price": {
+                        "anyOf": [{"type": "number"}, {"type": "null"}]
                     }
                 },
-                "required": ["query"],
-                "additionalProperties": False
+                "required": ["search_terms", "quantity", "max_price"]
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_stock",
-            "description": (
-                "Check real product existence and stock availability. "
-                "Use this tool whenever the user asks whether a specific "
-                "quantity of a product is available or indicates an "
-                "intention to purchase a known product and quantity. "
-                "Never answer a stock question without this tool result."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_id": {
-                        "type": "string",
-                        "description": (
-                            "Exact product ID returned by the catalog, "
-                            "for example PROD-O15."
-                        )
-                    },
-                    "quantity": {
-                        "type": "integer",
-                        "description": "Number of units requested."
-                    }
-                },
-                "required": ["product_id", "quantity"],
-                "additionalProperties": False
-            }
-        }
-    }
-]
+    "required": ["items"]
+}
 
 
 # ============================================================
@@ -293,138 +296,225 @@ tools = [
 # ============================================================
 
 SYSTEM_PROMPT = """
-Sei l'AI Shopping Assistant di MiniCommerce.
-Interpreti i messaggi degli utenti e scegli quali strumenti utilizzare.
-Rispondi sempre in italiano.
+Sei il modulo di comprensione delle richieste di MiniCommerce.
+Leggi il messaggio dell'utente ed estrai cosa vuole comprare.
+Rispondi SOLO con un JSON di questa forma:
 
-GESTIONE DELLE RICHIESTE:
+{"items": [{"search_terms": [...], "quantity": <intero o null>, "max_price": <numero o null>}]}
 
-1. Interpreta il significato del messaggio in linguaggio naturale.
-   Non richiedere un formato specifico per gli identificativi
-   o per le quantità.
+REGOLE:
 
-2. Se l'utente cerca un prodotto, invoca search_products.
+1. Ogni prodotto diverso richiesto è un elemento di items, con la
+   propria quantity.
+2. search_terms contiene il nome di quel prodotto: parole chiave
+   brevi, al singolare, in minuscolo. Mai saluti, quantità,
+   unità di misura, pesi o prezzi.
+3. Aggiungi sempre 2-3 sinonimi o prodotti più specifici dello
+   stesso tipo, così si trovano anche nomi simili.
+4. quantity è il numero di unità volute di quel prodotto. Converti
+   i numeri scritti a parole (tre = 3, una dozzina = 12, un paio = 2).
+   "un", "una", "uno" davanti al prodotto = 1. Pesi e misure
+   (1kg, 30kg) NON sono quantità. Se non è indicata, null.
+5. max_price è il prezzo massimo del SINGOLO prodotto (es. "sotto i
+   20 euro", "massimo 50 euro l'uno"). Non moltiplicarlo per la
+   quantità. Se l'utente indica un budget totale complessivo, o non
+   indica nessun prezzo, null.
+6. Se il messaggio non nomina nessun prodotto (per esempio solo
+   un saluto), items deve essere [].
+7. Non inventare, non rispondere alla domanda, non scrivere altro.
 
-3. Se l'utente scrive soltanto un identificativo prodotto,
-   invoca search_products per verificare se esiste.
-   Se esiste, presenta le informazioni ottenute e chiedi quante
-   unità desidera. Non presumere che voglia acquistarlo.
+ESEMPI:
 
-4. Se l'utente indica un prodotto e una quantità e domanda se
-   sono disponibili, invoca check_stock prima di rispondere.
+Utente: ciao voglio carne 1kg
+{"items": [{"search_terms": ["carne", "manzo", "pollo", "maiale"], "quantity": null, "max_price": null}]}
 
-5. Se il nome o l'identificativo non identifica chiaramente
-   un prodotto, usa search_products oppure chiedi chiarimenti.
+Utente: vorrei 3 tavoli e una lampada
+{"items": [{"search_terms": ["tavolo", "scrivania", "tavolino"], "quantity": 3, "max_price": null}, {"search_terms": ["lampada", "lampadina", "abat-jour"], "quantity": 1, "max_price": null}]}
 
-6. Non inventare prodotti, identificativi, prezzi o quantità.
-   I dati reali devono provenire dai risultati degli strumenti.
+Utente: mi servono dodici cuffie sotto i 50 euro
+{"items": [{"search_terms": ["cuffia", "auricolare", "cuffie"], "quantity": 12, "max_price": 50}]}
 
-7. Non mostrare ragionamenti interni, bozze o monologhi.
-   Dopo l'esecuzione degli strumenti, formula direttamente
-   una risposta breve e naturale.
-
-8. Se un tool segnala che un prodotto non esiste, comunica
-   chiaramente il risultato.
-
-9. Se la quantità richiesta supera quella disponibile, indica
-   la quantità effettivamente disponibile e chiedi se l'utente
-   desidera modificare la richiesta.
-
-10. Non creare ordini, non effettuare pagamenti e non modificare
-    direttamente il database.
-
-GESTIONE DEL CARRELLO:
-
-Se check_stock conferma che la quantità richiesta è disponibile,
-puoi proporre al frontend l'azione usando esattamente:
-
-ACTION: ADD_TO_CART
-PRODUCT_ID: <productId>
-QUANTITY: <quantity>
-
-Usa esclusivamente i valori verificati dal tool.
-Non emettere l'azione se il prodotto o la quantità non sono stati
-verificati, oppure se la disponibilità è insufficiente.
-
-Non dichiarare mai che il prodotto sia già stato aggiunto al carrello.
-L'azione è soltanto una proposta per il frontend.
+Utente: ciao
+{"items": []}
 """
 
 
 # ============================================================
-# TOOL EXECUTION
-# Python executes tool calls selected by the LLM.
-# It does not classify or parse the user's original message.
+# PARSING DELL'OUTPUT DEL MODELLO
+# I modelli piccoli sbagliano spesso i tipi: normalizziamo.
 # ============================================================
 
-def execute_tool(
-        tool_name: str,
-        arguments: dict[str, Any]
-) -> dict[str, Any]:
-    """Execute a tool requested by the model."""
+def parse_search_terms(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+
+    if not isinstance(raw, list):
+        return []
+
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+
+        term = item.strip()
+
+        if term and term.lower() not in seen:
+            seen.add(term.lower())
+            terms.append(term)
+
+    return terms
+
+
+def parse_positive_number(raw: Any, cast: type) -> Any:
+    if raw is None or isinstance(raw, bool):
+        return None
 
     try:
-        if tool_name == "search_products":
-            query = arguments.get("query", "")
+        value = cast(raw)
+    except (TypeError, ValueError):
+        return None
 
-            if not isinstance(query, str):
-                return {
-                    "error": "query deve essere una stringa."
-                }
+    return value if value > 0 else None
 
-            return search_products(query)
 
-        if tool_name == "check_stock":
-            product_id = (
-                    arguments.get("product_id")
-                    or arguments.get("productId")
+def parse_items(raw: Any) -> list[dict[str, Any]]:
+    # Un modello distratto può restituire un solo oggetto invece di una lista.
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    if not isinstance(raw, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+
+        terms = parse_search_terms(
+            entry.get("search_terms")
+        )[:MAX_SEARCH_TERMS]
+
+        if not terms:
+            continue
+
+        items.append({
+            "searchTerms": terms,
+            "quantity": parse_positive_number(entry.get("quantity"), int),
+            "maxPrice": parse_positive_number(entry.get("max_price"), float)
+        })
+
+    return items[:MAX_ITEMS]
+
+
+# ============================================================
+# RISPOSTA: sempre un JSON con la stessa struttura
+# ============================================================
+
+def flatten_terms(items: list[dict[str, Any]]) -> list[str]:
+    terms: list[str] = []
+
+    for item in items:
+        for term in item["searchTerms"]:
+            if term.lower() not in {t.lower() for t in terms}:
+                terms.append(term)
+
+    return terms
+
+
+def build_response(
+        products: list[dict[str, Any]],
+        items: list[dict[str, Any]],
+        message: str | None = None
+) -> dict[str, Any]:
+    return {
+        "count": len(products),
+        "request": {
+            "searchTerms": flatten_terms(items),
+            "items": items
+        },
+        "products": products,
+        "message": message
+    }
+
+
+# ============================================================
+# AGENT
+# LLM ESTRAE PRODOTTI E QUANTITÀ -> PYTHON CERCA E CONFRONTA LO STOCK
+# -> JSON
+#
+# Il JSON finale lo costruisce Python con i dati reali del servizio,
+# non l'LLM: così il formato è garantito e nessun campo viene
+# inventato o perso. Serve una sola chiamata al modello.
+# ============================================================
+
+def extract_items(user_message: str) -> list[dict[str, Any]]:
+    response = ollama_client.chat(
+        model=OLLAMA_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message}
+        ],
+        format=SEARCH_SCHEMA,
+        think=False,
+        options={
+            "temperature": 0,
+            "num_ctx": 4096,
+            "num_predict": 512
+        },
+        keep_alive="10m"
+    )
+
+    content = (response.message.content or "").strip()
+
+    logger.info("Output del modello: %s", content)
+
+    try:
+        data = json.loads(content)
+    except ValueError:
+        logger.warning("Il modello non ha restituito un JSON valido: %r", content)
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    return parse_items(data.get("items"))
+
+
+def run_agent(user_message: str) -> dict[str, Any]:
+    items = extract_items(user_message)
+
+    if not items:
+        return build_response(
+            products=[],
+            items=[],
+            message=(
+                "Non ho capito quale prodotto cerchi. "
+                "Puoi indicarmi il nome del prodotto?"
             )
-            quantity = arguments.get("quantity")
-
-            if (
-                    not isinstance(product_id, str)
-                    or not product_id.strip()
-            ):
-                return {
-                    "error": "product_id deve essere una stringa valida."
-                }
-
-            if (
-                    isinstance(quantity, bool)
-                    or not isinstance(quantity, int)
-            ):
-                return {
-                    "error": "quantity deve essere un numero intero."
-                }
-
-            return check_stock(
-                product_id.strip(),
-                quantity
-            )
-
-        return {
-            "error": f"Tool sconosciuto: {tool_name}"
-        }
-
-    except RuntimeError as exc:
-        logger.exception(
-            "Errore durante l'esecuzione del tool %s",
-            tool_name
         )
 
-        return {
-            "error": str(exc),
-            "tool": tool_name
-        }
+    products = search_products(items)
+
+    return build_response(
+        products=products,
+        items=items,
+        message=(
+            None if products
+            else "Nessun prodotto trovato per: "
+                 f"{', '.join(flatten_terms(items))}."
+        )
+    )
 
 
 # ============================================================
 # CHAT ENDPOINT
-# LLM DECIDES -> PYTHON EXECUTES -> LLM RESPONDS
 # ============================================================
 
 @app.post("/api/ai/chat")
-def chat_endpoint(request: ChatRequest):
+def chat_endpoint(request: ChatRequest) -> dict[str, Any]:
     message = request.message.strip()
 
     if not message:
@@ -433,120 +523,25 @@ def chat_endpoint(request: ChatRequest):
             detail="Il messaggio non può essere vuoto."
         )
 
-    # La lista contiene messaggi utente/sistema e oggetti Message
-    # restituiti dall'SDK Ollama.
-    messages: list[Any] = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        },
-        {
-            "role": "user",
-            "content": message
-        }
-    ]
-
     try:
-        # Ciclo agentico:
-        # il modello può richiedere strumenti in più passaggi.
-        for _ in range(MAX_TOOL_ROUNDS + 1):
+        return run_agent(message)
 
-            response = ollama_client.chat(
-                model=OLLAMA_MODEL,
-                messages=messages,
-                tools=tools,
-                think=True,
-                options={
-                    "num_ctx": 4096,
-                    "num_predict": 512,
-                    "temperature": 0
-                },
-                keep_alive="10m"
-            )
-
-            assistant_message = response.message
-            tool_calls = assistant_message.tool_calls or []
-
-            # Nessuna chiamata a tool:
-            # il modello ha concluso la risposta.
-            if not tool_calls:
-                content = (
-                        assistant_message.content or ""
-                ).strip()
-
-                # Il campo thinking non viene restituito all'utente.
-                if not content:
-                    logger.warning(
-                        "Ollama non ha prodotto contenuto finale. "
-                        "Thinking presente: %s",
-                        bool(assistant_message.thinking)
-                    )
-
-                    return {
-                        "response": (
-                            "Non sono riuscito a completare la risposta. "
-                            "Puoi riformulare la richiesta?"
-                        )
-                    }
-
-                return {
-                    "response": content
-                }
-
-            # Salva il messaggio dell'assistente con le chiamate
-            # strutturate così come raccomandato dall'SDK Ollama.
-            messages.append(assistant_message)
-
-            # Esegue esclusivamente le funzioni invocate dal modello.
-            for tool_call in tool_calls:
-                function = tool_call.function
-                arguments = dict(function.arguments or {})
-
-                result = execute_tool(
-                    function.name,
-                    arguments
-                )
-
-                logger.info(
-                    "Tool richiesto da Ollama: %s",
-                    function.name
-                )
-
-                # Il risultato viene rimandato al modello.
-                messages.append({
-                    "role": "tool",
-                    "tool_name": function.name,
-                    "content": json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        default=str
-                    )
-                })
-
-            # Si ripete il ciclo: Ollama può usare i risultati,
-            # chiamare altri strumenti oppure formulare la risposta.
+    except ProductServiceError as exc:
+        logger.exception("Errore del Product Service")
 
         raise HTTPException(
-            status_code=502,
-            detail=(
-                "Ollama ha superato il numero massimo di passaggi "
-                "con gli strumenti senza completare la risposta."
-            )
-        )
-
-    except HTTPException:
-        raise
+            status_code=503,
+            detail="Il Product Service non è raggiungibile o non risponde correttamente."
+        ) from exc
 
     except Exception as exc:
-        logger.exception(
-            "Errore durante la richiesta AI"
-        )
+        logger.exception("Errore durante la richiesta AI")
 
         raise HTTPException(
             status_code=502,
             detail=(
                 "Errore durante l'elaborazione della richiesta AI. "
-                "Verifica Ollama e i log del servizio."
+                "Controlla Ollama e i log del servizio."
             )
         ) from exc
 

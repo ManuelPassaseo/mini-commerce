@@ -23,7 +23,7 @@
       - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: rabbit
-      RABBITMQ_DEFAULT_PASS: rabbit
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -166,7 +166,7 @@
     ports:
       - "9004:9004"
     environment:
-      OLLAMA_MODEL: qwen3:4b
+      OLLAMA_MODEL: qwen3:1.7b
       OLLAMA_HOST: http://host.docker.internal:11434
       PRODUCT_SERVICE_URL: http://product:9002
     extra_hosts:
